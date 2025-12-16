@@ -13,9 +13,18 @@ dashpot_damping = 1e4 # 两个质点相对移动导致的阻尼系数
 # 内力宽泛地表示弹簧弹性形变导致的内力，以及两点间相对运动导致的阻尼
 drag_damping = 1 # 弹簧阻尼系数
 
-ball_radius = 0.3 # 球中心是一维field，唯一元素是三维浮点数向量
+avg_speed = ti.field(dtype=float, shape=())
+
+table_y = 0.0
+table_mu = 2.0
+table_bounds = 0.8
+
+ball_radius = 0.1 # 球中心是一维field，唯一元素是三维浮点数向量
 ball_center = ti.Vector.field(3, dtype=float, shape=(1, ))
-ball_center[0] = [0, 0, 0] # 放在原点
+ball_center[0] = [0, table_y+ball_radius, 0] # 放在桌子上
+
+
+
 # x(position), v(velocities)是nxn的field，有3d漂浮点的向量
 x = ti.Vector.field(3, dtype=float, shape=(n, n))
 v = ti.Vector.field(3, dtype=float, shape=(n, n))
@@ -26,6 +35,13 @@ indices = ti.field(int, shape=num_triangles * 3)
 vertices = ti.Vector.field(3, dtype=float, shape=n * n)
 colors = ti.Vector.field(3, dtype=float, shape=n * n)
 
+# table mesh
+table_vertices = ti.Vector.field(3, dtype=float, shape=8)
+table_indices = ti.field(int, shape = 12 * 3)
+table_color = (0.2,0.2,0.2)
+table_half = 1.0
+table_thick = 0.02
+
 bending_springs = False
 # kernel装饰器可以并行计算
 @ti.kernel
@@ -35,10 +51,41 @@ def initialize_mass_points():
     # 轻微移动cloth，随机偏离
     for i, j in x:
         x[i, j] = [
-            i * quad_size - 0.5 + random_offset[0], 0.6,
+            i * quad_size - 0.5 + random_offset[0], 0.9,
             j * quad_size - 0.5 + random_offset[1]
         ]
         v[i, j] = [0, 0, 0] # 初速度为0
+
+# M1:table initialization
+@ti.kernel
+def init_table_mesh():
+    y0 = table_y - table_thick
+    y1 = table_y
+    table_vertices[0] = [-table_half, y0, -table_half]
+    table_vertices[1] = [table_half, y0, -table_half]
+    table_vertices[2] = [table_half, y0, table_half]
+    table_vertices[3] = [-table_half, y0, table_half]
+    table_vertices[4] = [-table_half, y1, -table_half]
+    table_vertices[5] = [ table_half, y1, -table_half]
+    table_vertices[6] = [ table_half, y1, table_half]
+    table_vertices[7] = [ -table_half, y1, table_half]
+
+    idx = ti.Vector([
+        # bottom
+        0, 2, 1, 0, 3, 2,
+        # top
+        4, 5, 6, 4, 6, 7,
+        # front(-z)
+        0, 1, 5, 0, 5, 4,
+        # back(+z)
+        3, 7, 6, 3, 6, 2,
+        # left(-x)
+        0, 4, 7, 0, 7, 3,
+        # right(+x)
+        1, 2, 6, 1, 6, 5
+    ])
+    for k in range(36):
+        table_indices[k] = idx[k]
 
 # cloth由nxn的质点网络表示
 # 或者是由小正方形组成的n-1 x n-1的网络
@@ -65,8 +112,22 @@ def initialize_mesh_indices():
             colors[i * n + j] = (0.22, 0.72, 0.52)
         else:
             colors[i * n + j] = (1, 0.334, 0.52)
+# 仿真
+
+@ti.kernel
+def compute_avg_speed():
+    s = 0.0
+    for I in ti.grouped(v):
+        s += v[I].norm()
+    avg_speed[None] = s / (n * n)
+
 
 initialize_mesh_indices()
+# 调用初始化函数，尤其是table
+init_table_mesh()
+
+
+
 # cloth作为一个有质量的弹簧网格进行建模，假设质点的相对index是(0,0)至少被12个周围点影响
 # spring offsets，用来存储受影响点的相对index的列表
 spring_offsets = []
@@ -114,16 +175,39 @@ def substep():
         v[i] += force * dt
 
     for i in ti.grouped(x):
-        # 穿越场v里的元素
+        # 1) 空气阻尼
         v[i] *= ti.exp(-drag_damping * dt)
-        offset_to_center = x[i] - ball_center[0]
-        if offset_to_center.norm() <= ball_radius:
-            # Velocity projection
-            normal = offset_to_center.normalized()
-            # 算出速度的积累
-            v[i] -= min(v[i].dot(normal), 0) * normal
-            # 算出每个质点的最终位置
+
+        # 2) 积分
         x[i] += dt * v[i]
+
+        # M2升级碰撞模型
+        # 3）球体碰撞：位置投影+正常速度投影
+        offset = x[i] - ball_center[0]
+        dist = offset.norm()
+        if dist < ball_radius:
+            nrm = offset / (dist + 1e-6)
+            # push point to sphere surface
+            x[i] = ball_center[0] + ball_radius * nrm
+            # remove inward normal velocity
+            vn = v[i].dot(nrm)
+            if vn < 0:
+                v[i] -= vn * nrm
+
+        # 4) 桌面碰撞=位置投影+正常速度+tan摩擦
+        # M1：桌面碰撞
+        if x[i].y < table_y:
+            x[i].y = table_y
+            if v[i].y < 0:
+                v[i].y = 0
+
+            v[i].x *= ti.exp(-table_mu * dt)
+            v[i].z *= ti.exp(-table_mu * dt)
+            
+        # 5）额外的碰撞边界
+        x[i].x = ti.max(-table_bounds, ti.min(table_bounds, x[i].x))
+        x[i].z = ti.max(-table_bounds, ti.min(table_bounds, x[i].z))
+
 
 # 每个帧都要调用update_vertices，顶点在模拟中持续更新
 @ti.kernel
@@ -131,8 +215,9 @@ def update_vertices():
     for i, j in ti.ndrange(n, n):
         vertices[i * n + j] = x[i, j]
 
-window = ti.ui.Window("Taichi Cloth Simulation on GGUI", (1024, 1024),
-                      vsync=True)
+window = ti.ui.Window("Taichi Cloth Simulation | [P] pause  [N] step  [R] reset", (1024, 1024), vsync=True)
+print("[Controls] P: pause/resume | N: step (when paused) | R: reset | ESC: quit")
+
 canvas = window.get_canvas()
 canvas.set_background_color((1, 1, 1))
 scene = ti.ui.Scene()
@@ -140,29 +225,60 @@ camera = ti.ui.Camera()
 
 current_t = 0.0
 initialize_mass_points()
+paused = False
+settled = False
+
+p_prev = False
+r_prev = False
+n_prev = False
 
 while window.running:
-    if current_t > 1.5:
-        # Reset
+    # --- hotkeys (inside loop) ---
+    # R reset (debounced)
+    r_now = window.is_pressed('r')
+    if r_now and (not r_prev):
         initialize_mass_points()
-        current_t = 0
+        current_t = 0.0
+        settled = False
+        paused = False
+    r_prev = r_now
 
-    for i in range(substeps):
-        substep()
-        current_t += dt
+    # P pause toggle (debounced)
+    p_now = window.is_pressed('p')
+    if p_now and (not p_prev):
+        paused = not paused
+    p_prev = p_now
+
+    # N single-step (debounced): only one frame step when paused
+    n_now = window.is_pressed('n')
+    step_once = (n_now and (not n_prev))
+    n_prev = n_now
+
+    # --- settle detection ---
+    compute_avg_speed()
+    if (not settled) and current_t > 1.0 and avg_speed[None] < 0.02:
+        settled = True
+        paused = True
+
+
+    # --- simulation stepping ---
+    if (not paused) or step_once:
+        for _ in range(substeps):
+            substep()
+            current_t += dt
     update_vertices()
 
-    camera.position(0.0, 0.0, 3)
+    # camera.position(0.0, 0.0, 3)
+    camera.position(0.8, 0.6, 2.2)
     camera.lookat(0.0, 0.0, 0)
     scene.set_camera(camera)
 
     scene.point_light(pos=(0, 1, 2), color=(1, 1, 1))
     scene.ambient_light((0.5, 0.5, 0.5))
-    scene.mesh(vertices,
-               indices=indices,
-               per_vertex_color=colors,
-               two_sided=True)
 
+    # draw table
+    scene.mesh(table_vertices, indices=table_indices, color=table_color, two_sided=True)
+    scene.mesh(vertices, indices=indices, per_vertex_color=colors, two_sided=True)
     # Draw a smaller ball to avoid visual penetration
     scene.particles(ball_center, radius=ball_radius * 0.95, color=(0.5, 0.42, 0.8))
     canvas.scene(scene)
