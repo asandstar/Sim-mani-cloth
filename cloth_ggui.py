@@ -288,11 +288,16 @@ for k, off in enumerate(spring_offsets):
 
 # ---- 每个点、每种 offset 的弹簧是否存活 ----
 spring_alive = ti.field(dtype=ti.i32, shape=(n, n, ns))
-
+# 每根弹簧的损伤 0~1，0=完好，1=完全断裂
+spring_damage = ti.field(dtype=ti.f32, shape=(n, n, ns))
+spring_toughness = ti.field(dtype=ti.f32, shape=(n, n, ns))  # 每根弹簧随机韧性 0.9~1.1
 @ti.kernel
 def init_springs():
     for i, j, k in spring_alive:
         spring_alive[i, j, k] = 1
+        spring_damage[i ,j ,k] = 0.0
+        # 每次 reset 都重新抽一张“材料噪声”，裂纹就不会次次一样直
+        spring_toughness[i, j, k] = 0.9 + 0.2 * ti.random()
 
 def find_off(dx, dz):
     for k, off in enumerate(spring_offsets):
@@ -320,6 +325,8 @@ def make_notch():
             # 1) 断中线结构边： (mid-1,j) <-> (mid,j)
             spring_alive[i, j, k_x] = 0
             spring_alive[i + 1, j, spring_opp[k_x]] = 0
+            spring_damage[i, j, k_x] = 1.0
+            spring_damage[i + 1, j, spring_opp[k_x]] = 1.0
 
             # 2) 断跨缝对角（上方那条）：(mid-1,j) <-> (mid,j+1)
             if j + 1 < n:
@@ -405,45 +412,81 @@ def substep():
                 d = x_ij / dist
 
                 stretch = dist / (L0 + 1e-6)
+                # 有损伤则降低刚度（软化）
+                w = 1.0 - spring_damage[i[0], i[1], k]
+                w = ti.max(SOFT_MIN, w)
 
+                                # ====== 空间加权撕裂：中线最容易，周围也可能被带裂 ======
+                if enable_tear[None] == 1:
+                    ax = ti.abs(off2[0])
+                    az = ti.abs(off2[1])
 
-                # ====== “中线竖缝”撕裂（从中间撕成两半）======
-                mid = n // 2
+                    is_struct_x = (az == 0) and (ax == 1)   # (±1,0)
+                    is_struct_z = (ax == 0) and (az == 1)   # (0,±1)
+                    is_shear    = (ax == 1) and (az == 1)   # (±1,±1)
 
-                # 只考虑结构边 (±1, 0)，也就是 i 方向的相邻点弹簧
-                is_struct_x = (off2[1] == 0) and (ti.abs(off2[0]) == 1)
+                    # 只在这些“网格边/剪切边”上允许损伤（避免弯曲弹簧乱裂）
+                    is_tear_edge = is_struct_x or is_struct_z or is_shear
 
-                # 只允许跨过中线那条缝：i = mid-1 <-> mid
-                # 两个方向都要覆盖：从 mid-1 指向 mid（dx=+1），以及从 mid 指向 mid-1（dx=-1）
+                    if is_tear_edge:
+                        mid = n // 2
 
-                is_mid_seam = is_struct_x and (
-                    (i[0] == mid - 1 and off2[0] == 1) or
-                    (i[0] == mid     and off2[0] == -1)
-                )
+                        # 这根弹簧相对于“中线 x = mid-0.5”的距离（以格子为单位）
+                        # 用端点平均更稳定（不依赖方向）
+                        x_mid_edge = 0.5 * (ti.cast(i[0], ti.f32) + ti.cast(j[0], ti.f32))
+                        seam_dist  = ti.abs(x_mid_edge - (ti.cast(mid, ti.f32) - 0.5))
 
-                if enable_tear[None] == 1 and is_mid_seam and stretch > tear_ratio_dyn[None]:
-                    # 断结构边（双向）
-                    spring_alive[i[0], i[1], k] = 0
-                    spring_alive[j[0], j[1], ok] = 0
-                # 额外：断掉该段附近跨缝对角（两条）
-                    # 统一用 L 表示中线左侧点 (mid-1, j)
-                    Lp = i if (i[0] == mid - 1) else j
-                    li, lj = Lp[0], Lp[1]
+                        # 中线权重：近中线≈1，远离→0（高斯型）
+                        seam = ti.exp(-(seam_dist / SEAM_W) * (seam_dist / SEAM_W))
 
-                    # (mid-1,lj) <-> (mid,lj+1)
-                    if lj + 1 < n:
-                        spring_alive[li, lj, k_d_p] = 0
-                        spring_alive[li + 1, lj + 1, spring_opp[k_d_p]] = 0
+                        # 类型权重：结构边更容易形成“真实裂缝”，剪切边偏辅助
+                        type_w = 1.0
+                        if is_struct_z:
+                            type_w = 0.75
+                        elif is_shear:
+                            type_w = 0.35
 
-                        # (mid-1,lj+1) <-> (mid,lj)
-                        spring_alive[li, lj + 1, k_d_m] = 0
-                        spring_alive[li + 1, lj, spring_opp[k_d_m]] = 0
-                    continue
+                        # 局部阈值：离中线越远越难裂；再乘一点随机韧性让路径不理想
+                        thr = tear_ratio_dyn[None]
+                        thr_local = thr * (1.0 + THR_OFF * (1.0 - seam)) * spring_toughness[i[0], i[1], k]
 
-                # ================================================
+                        if stretch > thr_local:
+                            excess = stretch - thr_local
+
+                            # 局部速率：中线快，远处慢；再乘类型权重
+                            rate_local = DAMAGE_RATE * (seam + RATE_OFF * (1.0 - seam)) * type_w
+
+                            add = rate_local * (excess ** DAMAGE_POW) * dt
+                            spring_damage[i[0], i[1], k] = ti.min(1.0, spring_damage[i[0], i[1], k] + add)
+                            spring_damage[j[0], j[1], ok] = spring_damage[i[0], i[1], k]
+
+                            # 软化（注意：你后面弹簧力要乘 w=1-damage，这点你已做过/将做）
+                            if spring_damage[i[0], i[1], k] >= 1.0 - 1e-6:
+                                spring_alive[i[0], i[1], k] = 0
+                                spring_alive[j[0], j[1], ok] = 0
+                                # 可选：断了就把 damage 拉满，避免残余软连接
+                                spring_damage[i[0], i[1], k] = 1.0
+                                spring_damage[j[0], j[1], ok] = 1.0
+
+                                # 断结构边时，顺带断掉跨缝对角，避免视觉“挂丝”
+                                # （只在结构边上做就够了）
+                                if is_struct_x:
+                                    L = i if off2[0] == 1 else j
+                                    li, lj = L[0], L[1]
+                                    if lj + 1 < n:
+                                        spring_alive[li, lj, k_d_p] = 0
+                                        spring_alive[li + 1, lj + 1, spring_opp[k_d_p]] = 0
+                                        spring_damage[li, lj, k_d_p] = 1.0
+                                        spring_damage[li + 1, lj + 1, spring_opp[k_d_p]] = 1.0
+                                    if lj - 1 >= 0:
+                                        spring_alive[li, lj, k_d_m] = 0
+                                        spring_alive[li + 1, lj - 1, spring_opp[k_d_m]] = 0
+                                        spring_damage[li, lj, k_d_m] = 1.0
+                                        spring_damage[li + 1, lj - 1, spring_opp[k_d_m]] = 1.0
+                # =====================================================
 
                 # 弹簧力 + dashpot
-                force += -spring_Y * d * (stretch - 1.0)
+                force += -spring_Y * w * d * (stretch - 1.0)
                 force += -v_ij.dot(d) * d * dashpot_damping * quad_size
 
         v[i] += force * dt
@@ -533,6 +576,13 @@ frame_id = 0
 notch_done = False
 TEAR_RATIO_SAFE = 3.0   # 抬起/移动阶段：不希望乱裂
 TEAR_RATIO_TEAR = 1.2   # 真撕裂阶段：希望容易裂
+DAMAGE_RATE = 35.0
+DAMAGE_POW = 2.0
+SOFT_MIN = 0.05
+SEAM_W      = 2.5    # “中线影响宽度”（单位：格子），越大越容易偏折
+THR_OFF     = 1.0    # 离中线越远，阈值提高：thr_local = thr*(1+THR_OFF*(1-seam))
+RATE_OFF    = 0.15   # 离中线越远，损伤增长衰减：rate_local *= seam + RATE_OFF*(1-seam)
+
 last_phase = -999
 
 while window.running:
