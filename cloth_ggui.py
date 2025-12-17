@@ -48,10 +48,15 @@ clamp_gap_close = 0.02   # 夹住后的缝隙
 clamp_gap = ti.field(dtype=ti.f32, shape=())
 clamp_gap[None] = clamp_gap_open
 
-clamp_R = 2  # 1=>3x3 patch；2=>5x5（先用1）
+clamp_R = 3
 clamp_dpos = ti.Vector.field(3, dtype=ti.f32, shape=(num_clamps, 2*clamp_R+1, 2*clamp_R+1))
 
-tear_ratio = 1.35   # 越小越容易撕（1.6~2.0 常用）
+tear_ratio = 2.8   # 越小越容易撕（1.6~2.0 常用）
+enable_tear = ti.field(dtype=ti.i32, shape=())
+enable_tear[None] = 0
+
+tear_ratio_dyn = ti.field(dtype=ti.f32, shape=())
+tear_ratio_dyn[None] = 3.0   # 抬起阶段阈值大
 
 # 夹住的两个布点 index（固定夹两侧）
 clamp_ij = ti.Vector.field(2, dtype=ti.i32, shape=(num_clamps,))
@@ -157,16 +162,8 @@ def compute_avg_speed():
 # M3:add clamps
 @ti.kernel
 def init_clamps():
-    # 两边
-    # clamp_ij[0] = ti.Vector([2,      n // 2])
-    # clamp_ij[1] = ti.Vector([n - 3,  n // 2])
-    # 对角
-    # clamp_ij[0] = ti.Vector([n // 4,  n // 4])
-    # clamp_ij[1] = ti.Vector([3*n // 4, 3*n // 4])
-    clamp_ij[0] = ti.Vector([2, 2])
-    clamp_ij[1] = ti.Vector([n-3, n-3])
-
-
+    clamp_ij[0] = ti.Vector([2,      n // 2])
+    clamp_ij[1] = ti.Vector([n - 3,  n // 2])
 
     for k in range(num_clamps):
         clamp_pos[k]  = ti.Vector([0.0, table_y + 2.0, 0.0])  # 初始丢到高处（不生效）
@@ -306,32 +303,50 @@ def find_off(dx, dz):
 k_x  = find_off(1, 0)    # (i,j) -> (i+1,j)
 k_z  = find_off(0, 1)    # (i,j) -> (i,j+1)
 k_d1 = find_off(1, 1)    # diag
-# k_d2 = find_off(1,-1)    # other diag（如果你的 offsets 没有(1,-1)，就用(-1,1)对应的写法）
 k_d2 = find_off(-1, 1)
+k_d_p = find_off(1,  1)   # (i,j) -> (i+1,j+1)
+k_d_m = find_off(1, -1)   # (i,j) -> (i+1,j-1)
+
 
 @ti.kernel
 def make_notch():
-    # 从中心附近沿对角线断一小段“对角弹簧”作为裂纹起点
-    i0 = n // 2 - 6
-    j0 = n // 2 - 2
-    for t in range(12):  # notch 长度
-        i = i0 + t
+    mid = n // 2
+    i = mid - 1
+    j0 = n // 2 - 4
+    L  = 12
+    for t in range(L):
         j = j0 + t
-        spring_alive[i+1, j, k_d1] = 0
-        spring_alive[i, j+1, spring_opp[k_d1]] = 0        
+        if 0 <= j < n:
+            # 1) 断中线结构边： (mid-1,j) <-> (mid,j)
+            spring_alive[i, j, k_x] = 0
+            spring_alive[i + 1, j, spring_opp[k_x]] = 0
+
+            # 2) 断跨缝对角（上方那条）：(mid-1,j) <-> (mid,j+1)
+            if j + 1 < n:
+                spring_alive[i, j, k_d_p] = 0
+                spring_alive[i + 1, j + 1, spring_opp[k_d_p]] = 0
+
+            # 3) 断跨缝对角（下方那条）：(mid-1,j+1) <-> (mid,j)
+            if j + 1 < n:
+                spring_alive[i, j + 1, k_d_m] = 0
+                spring_alive[i + 1, j, spring_opp[k_d_m]] = 0
 
 
 @ti.kernel
 def update_mesh_indices_by_tears():
-    for i, j in ti.ndrange(n - 1, n - 1):
+
+    for i, j in ti.ndrange(n - 1, n - 1):  # 遍历网格中的每个四边形（除了边界）
         quad_id = i * (n - 1) + j
         v00 = i * n + j
         v10 = (i + 1) * n + j
         v01 = i * n + (j + 1)
         v11 = (i + 1) * n + (j + 1)
 
-        # 共有边：v10 <-> v01，用 k_d2 = (-1, +1) 表示从 v10 指向 v01
-        diag_alive = spring_alive[i + 1, j, k_d2]
+        # # 共有边：v10 <-> v01，用 k_d2 = (-1, +1) 表示从 v10 指向 v01
+        # diag_alive = spring_alive[i + 1, j, k_d2]
+        diag_a = spring_alive[i + 1, j, k_d2]       # v10<->v01  (-1,+1)
+        diag_b = spring_alive[i, j, k_d_p]          # v00<->v11  (+1,+1)
+        diag_alive = 1 if (diag_a != 0 or diag_b != 0) else 0
 
         # tri1: (v00, v10, v01)
         alive1 = 1
@@ -391,18 +406,40 @@ def substep():
 
                 stretch = dist / (L0 + 1e-6)
 
-                # ====== 只允许“网格边/对角剪切边”撕裂 ======
-                ax = ti.abs(off2[0])
-                az = ti.abs(off2[1])
 
-                # 结构边：(|dx|+|dz|==1)  => (1,0) 或 (0,1)
-                # 剪切边：(|dx|==1 且 |dz|==1) => (1,1)
-                is_tear_edge = (ax + az == 1) or (ax == 1 and az == 1)
+                # ====== “中线竖缝”撕裂（从中间撕成两半）======
+                mid = n // 2
 
-                if is_tear_edge and stretch > tear_ratio:
+                # 只考虑结构边 (±1, 0)，也就是 i 方向的相邻点弹簧
+                is_struct_x = (off2[1] == 0) and (ti.abs(off2[0]) == 1)
+
+                # 只允许跨过中线那条缝：i = mid-1 <-> mid
+                # 两个方向都要覆盖：从 mid-1 指向 mid（dx=+1），以及从 mid 指向 mid-1（dx=-1）
+
+                is_mid_seam = is_struct_x and (
+                    (i[0] == mid - 1 and off2[0] == 1) or
+                    (i[0] == mid     and off2[0] == -1)
+                )
+
+                if enable_tear[None] == 1 and is_mid_seam and stretch > tear_ratio_dyn[None]:
+                    # 断结构边（双向）
                     spring_alive[i[0], i[1], k] = 0
                     spring_alive[j[0], j[1], ok] = 0
+                # 额外：断掉该段附近跨缝对角（两条）
+                    # 统一用 L 表示中线左侧点 (mid-1, j)
+                    Lp = i if (i[0] == mid - 1) else j
+                    li, lj = Lp[0], Lp[1]
+
+                    # (mid-1,lj) <-> (mid,lj+1)
+                    if lj + 1 < n:
+                        spring_alive[li, lj, k_d_p] = 0
+                        spring_alive[li + 1, lj + 1, spring_opp[k_d_p]] = 0
+
+                        # (mid-1,lj+1) <-> (mid,lj)
+                        spring_alive[li, lj + 1, k_d_m] = 0
+                        spring_alive[li + 1, lj, spring_opp[k_d_m]] = 0
                     continue
+
                 # ================================================
 
                 # 弹簧力 + dashpot
@@ -449,10 +486,10 @@ def substep():
         x[i].z = ti.max(-table_bounds, ti.min(table_bounds, x[i].z))
 
     if clamp_on[None] == 1:
-        for ck in ti.static(range(num_clamps)):
+        for ck in range(num_clamps):
             ci = clamp_ij[ck][0]
             cj = clamp_ij[ck][1]
-            for di, dj in ti.static(ti.ndrange((-clamp_R, clamp_R+1), (-clamp_R, clamp_R+1))):
+            for di, dj in ti.ndrange((-clamp_R, clamp_R+1), (-clamp_R, clamp_R+1)):
                 ii = ti.max(0, ti.min(n-1, ci + di))
                 jj = ti.max(0, ti.min(n-1, cj + dj))
                 x[ii, jj] = clamp_pos[ck] + clamp_dpos[ck, di + clamp_R, dj + clamp_R]
@@ -470,15 +507,17 @@ def update_vertices():
 window = ti.ui.Window("Taichi Cloth Simulation | [P] pause  [N] step  [R] reset", (1024, 1024), vsync=True)
 print("[Controls] P pause | N step | R reset | Auto: drop -> attach -> lift -> pull -> tear")
 
+# canvas = window.get_canvas()
 canvas = window.get_canvas()
 canvas.set_background_color((1, 1, 1))
-scene = ti.ui.Scene()
+# scene = ti.ui.Scene()
+scene = window.get_scene()
 camera = ti.ui.Camera()
 
 current_t = 0.0
 initialize_mass_points()
 init_springs()
-make_notch()
+# make_notch()
 paused = False
 settled = False
 p_prev = False
@@ -490,8 +529,11 @@ t_phase = 0.0      # 每个阶段内部计时
 phase = 0
 auto_run = True
 clamp_on[None] = 0
-
-
+frame_id = 0
+notch_done = False
+TEAR_RATIO_SAFE = 3.0   # 抬起/移动阶段：不希望乱裂
+TEAR_RATIO_TEAR = 1.2   # 真撕裂阶段：希望容易裂
+last_phase = -999
 
 while window.running:
     # --- hotkeys (inside loop) ---
@@ -500,7 +542,7 @@ while window.running:
     if r_now and (not r_prev):
         initialize_mass_points()
         init_springs()
-        make_notch()
+ 
         current_t = 0.0
         settled = False
         paused = False
@@ -508,7 +550,17 @@ while window.running:
         phase = 0
         auto_run = True
         clamp_on[None] = 0
+        enable_tear[None] = 0
+        tear_ratio_dyn[None] = TEAR_RATIO_SAFE
+        notch_done = False
+        last_phase = -999
+
     r_prev = r_now
+    if frame_id % 30 == 0:
+        ij0 = clamp_ij[0].to_numpy()
+        y_cloth = x[int(ij0[0]), int(ij0[1])].to_numpy()[1]
+        y_clamp = clamp_pos[0].to_numpy()[1]
+        print("frame", frame_id, "phase", phase, "on", clamp_on[None], "y_clamp", y_clamp, "y_cloth", y_cloth)
 
     # P pause toggle (debounced)
     p_now = window.is_pressed('p')
@@ -529,16 +581,27 @@ while window.running:
 
     if (not paused) or step_once:
         # --- auto two-stage script ---
+        if phase != last_phase:
+            # 进入新阶段时只做一次配置
+            if phase in (0, 1, 15, 2, 25):
+                enable_tear[None] = 0
+                tear_ratio_dyn[None] = TEAR_RATIO_SAFE
+            elif phase == 3:
+                enable_tear[None] = 1
+                tear_ratio_dyn[None] = TEAR_RATIO_TEAR
+
+            last_phase = phase
+            
         if auto_run:
             frame_dt = substeps * dt
 
-            # 目标参数（你可以后面再调）
+            # 目标参数
             y_lift = table_y + 0.40      # 抬起高度
-            y_pull = table_y + 0.38      # 拉开时高度（低一点更容易“撕”而不是“整块飞起来”）
-            pull_speed = 0.35            # 每秒拉开多少（单位：世界坐标）
-            lift_speed = 0.60            # 每秒抬起多少
-            pull_limit = 0.75            # 拉到多开停止（左右 clamp 的 x 距离的一半）
-            close_speed = 0.25
+            y_pull = table_y + 0.30      # 拉开时高度
+            pull_speed = 0.90            # 每秒拉开多少（单位：世界坐标）
+            lift_speed = 0.90            # 每秒抬起多少
+            pull_limit = 1.20            # 拉到多开停止（左右 clamp 的 x 距离的一半）
+            close_speed = 0.256
             if phase == 0:
                 # 阶段1：纯掉落，不夹
                 clamp_on[None] = 0
@@ -567,24 +630,30 @@ while window.running:
                     p[1] = min(y_lift, p[1] + lift_speed * frame_dt)
                     clamp_pos[k] = p
                 if clamp_pos[0].to_numpy()[1] >= y_lift - 1e-3:
+                    phase = 25
+                    
+            elif phase == 25:
+                for k in range(num_clamps):
+                    p = clamp_pos[k].to_numpy()
+                    p[1] = max(y_pull, p[1] - 0.60 * frame_dt)
+                    clamp_pos[k] = p
+                if clamp_pos[0].to_numpy()[1] <= y_pull + 1e-3:
+                    if not notch_done:
+                        make_notch()
+                        notch_done = True
                     phase = 3
-                    t_phase = 0.0
+
 
             elif phase == 3:
                 # 拉开：左右向两侧拉，同时压低到 y_pull
                 p0 = clamp_pos[0].to_numpy()
                 p1 = clamp_pos[1].to_numpy()
                 # 对边
-                # p0[0] -= pull_speed * frame_dt
-                # p1[0] += pull_speed * frame_dt
-                # 对角
                 p0[0] -= pull_speed * frame_dt
-                p0[2] -= pull_speed * frame_dt
                 p1[0] += pull_speed * frame_dt
-                p1[2] += pull_speed * frame_dt
 
-                p0[1] = y_lift
-                p1[1] = y_lift
+                p0[1] = y_pull
+                p1[1] = y_pull
 
                 # 防止飞出桌面范围
                 p0[0] = max(-table_bounds, p0[0])
@@ -614,9 +683,9 @@ while window.running:
     update_clamp_mesh_vertices()
 
     target = (0.0, table_y + 0.10, 0.0)  # 盯住布/球的上方一点
-    d = 1.6                           # 相机距离（越大越远）
-    h = 0.6                              # 相机高度（决定俯视角）
-    camera.position(0.3, target[1] + h, target[2] + d)
+    d = 1.8                           # 相机距离（越大越远）
+    h = 1                              # 相机高度（决定俯视角）
+    camera.position(0, target[1] + h, target[2] + d)
     camera.lookat(*target)
     camera.up(0.0, 1.0, 0.0)
     # camera.track_user_inputs(window, movement_speed=0.02, hold_key=ti.ui.RMB)
@@ -634,3 +703,4 @@ while window.running:
 
     canvas.scene(scene)
     window.show()
+    frame_id += 1
